@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import base64
-import io
+import json
 import os
-from typing import Optional
+from collections import Counter
+from typing import List
 
 from SkillGraph.skills.skill_library import Skill, SkillLibrary
-import json
+
+
+# Aligned with Appendix C (tau_f = 4). The previous default of 1 meant a single
+# failure triggered a rewrite, which contradicts the paper's claim that
+# evolution is driven by "consistent failure patterns rather than isolated
+# anomalies". Pass explicitly from config if you want a different value.
+DEFAULT_FAILURE_THRESHOLD = 4
 
 
 EVOLVE_PROMPT_TEMPLATE = """
@@ -15,7 +21,7 @@ You are an expert AI skill designer for a visual question-answering agent.
 
 Below is a reasoning skill that has been performing poorly, along with its recent failure cases.
 Each failure case includes: the question, the answer choices, the agent's wrong answer,
-the correct answer, and a diagnostic lesson that pinpoints exactly why the skill failed.
+the correct answer, a failure type, and a diagnostic lesson that pinpoints why the skill failed.
 
 [Current Skill]
 Name: {skill_name}
@@ -36,7 +42,18 @@ Strategy Description:
 The [Aggregated Diagnostic Lessons] section distills the root causes across the recent failures.
 Use these lessons as your PRIMARY basis for deciding what to change and how to change it.
 
-Specifically:
+Weight the evidence by failure type:
+- PERCEPTION dominant: the skill's observations of the image are unreliable. The fix belongs in
+  the strategy: add explicit verification steps (re-examine the relevant region, count twice,
+  cross-check each option against a stated observation), or narrow the trigger condition so that
+  a tool-equipped skill handles these cases instead.
+- REASONING dominant: the skill sees correctly but infers badly. The fix belongs in the inference
+  procedure: require the observation to be stated before a conclusion is drawn, require each
+  option to be eliminated against a stated observation, forbid concluding from priors alone.
+- AMBIGUOUS cases carry the least weight. Do not build the revision around them, and never treat
+  an AMBIGUOUS case as evidence of a perception problem.
+
+Then choose one action:
 - If the lessons point to failures that can be resolved by refining the current skill,
   choose MODIFY and update both trigger_condition and description so that every lesson is
   clearly addressed.
@@ -73,8 +90,8 @@ Respond ONLY with the following JSON (no markdown, no extra text):
 }}
 """
 
-# 单条失败案例格式化模板（含 choices 和 lesson）
-_CASE_TEMPLATE = """[Case {idx}] ID: {case_id}
+
+_CASE_TEMPLATE = """[Case {idx} | {failure_type}] ID: {case_id}
   Question: {question}
   Choices:
 {choices_block}
@@ -90,11 +107,39 @@ def _format_choices(choices: dict) -> str:
 
 
 def _build_lesson_summary(skill: Skill, max_cases: int = 5) -> str:
-    cases   = skill.failure_cases[-max_cases:]
-    lessons = [c.get("lesson", "").strip() for c in cases if c.get("lesson", "").strip()]
-    if not lessons:
+    """
+    Aggregate per-case diagnoses into the evidence block for evolution.
+
+    The failure-type histogram is the point of this function: it tells the
+    designer whether the skill is failing because it sees badly or because it
+    reasons badly, which are opposite fixes. Historical cases written before
+    failure_type existed default to AMBIGUOUS.
+    """
+    cases = skill.failure_cases[-max_cases:]
+    if not cases:
         return "(no diagnostic lessons available)"
-    return "\n".join(f"  {i+1}. {l}" for i, l in enumerate(lessons))
+
+    counts  = Counter(c.get("failure_type") or "AMBIGUOUS" for c in cases)
+    n_blind = sum(1 for c in cases if c.get("image_seen") is False)
+
+    header = (
+        f"  Failure-type distribution over the {len(cases)} most recent failures: "
+        f"PERCEPTION={counts.get('PERCEPTION', 0)}, "
+        f"REASONING={counts.get('REASONING', 0)}, "
+        f"AMBIGUOUS={counts.get('AMBIGUOUS', 0)}."
+    )
+    if n_blind:
+        header += (
+            f"\n  ({n_blind} of these were diagnosed without access to the image; "
+            f"treat their conclusions as weaker evidence.)"
+        )
+
+    lines = [header, ""]
+    for i, c in enumerate(cases, 1):
+        lesson = (c.get("lesson") or "").strip() or "(no lesson recorded)"
+        ftype  = c.get("failure_type") or "AMBIGUOUS"
+        lines.append(f"  {i}. [{ftype}] {lesson}")
+    return "\n".join(lines)
 
 
 def _build_failure_summary(skill: Skill, max_cases: int = 5) -> str:
@@ -105,6 +150,7 @@ def _build_failure_summary(skill: Skill, max_cases: int = 5) -> str:
     for idx, c in enumerate(cases, 1):
         lines.append(_CASE_TEMPLATE.format(
             idx           = idx,
+            failure_type  = c.get("failure_type") or "AMBIGUOUS",
             case_id       = c.get("id",           "unknown"),
             question      = c.get("question",     "(no question)"),
             choices_block = _format_choices(c.get("choices", {})),
@@ -115,30 +161,15 @@ def _build_failure_summary(skill: Skill, max_cases: int = 5) -> str:
     return "\n\n".join(lines)
 
 
-def _encode_image_for_llm(image_path: str) -> Optional[dict]:
-    if not image_path or not os.path.exists(image_path):
-        return None
-    try:
-        from PIL import Image as PILImage
-        img = PILImage.open(image_path).convert("RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=75)
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        return {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-    except Exception as e:
-        print(f"[SkillDesigner] image encode failed for {image_path}: {e}")
-        return None
-
-
 class SkillDesigner:
     def __init__(self, skill_library: SkillLibrary, llm):
         self.skill_library = skill_library
         self.llm           = llm
 
-    async def evolve(self, threshold: int = 1):
+    async def evolve(self, threshold: int = DEFAULT_FAILURE_THRESHOLD):
         hard_skills = self.skill_library.get_hard_cases(threshold=threshold)
         if not hard_skills:
-            print("[SkillDesigner] No skills need evolving.")
+            print(f"[SkillDesigner] No skills need evolving (threshold={threshold}).")
             return
         for skill in hard_skills:
             print(f"[SkillDesigner] Evolving: {skill.skill_name} "
@@ -149,31 +180,26 @@ class SkillDesigner:
         lesson_summary  = _build_lesson_summary(skill,  max_cases=5)
         failure_summary = _build_failure_summary(skill, max_cases=5)
 
-        text_prompt = EVOLVE_PROMPT_TEMPLATE.format(
+        prompt = EVOLVE_PROMPT_TEMPLATE.format(
             skill_name        = skill.skill_name,
             version           = skill.version,
             trigger_condition = skill.trigger_condition,
             description       = skill.description,
-            lesson_summary    = lesson_summary,   # 
+            lesson_summary    = lesson_summary,
             failure_summary   = failure_summary,
         )
 
-        image_block = None
-        for case in reversed(skill.failure_cases[-5:]):
-            image_path = case.get("image_path", "")
-            if image_path:
-                image_block = _encode_image_for_llm(image_path)
-                if image_block is not None:
-                    print(f"[SkillDesigner] attaching image: {image_path}")
-                    break
-
-        user_content = (
-            [image_block, {"type": "text", "text": text_prompt}]
-            if image_block is not None
-            else text_prompt
-        )
-
-        messages = [{"role": "user", "content": user_content}]
+        # Deliberately text-only.
+        #
+        # Every lesson in lesson_summary was produced with its own image
+        # attached (AnalyzeAgent._generate_lesson), so the visual evidence is
+        # already encoded per case. The previous version attached the first
+        # loadable image from the batch, which meant case 1's image sat next to
+        # a prompt describing five unrelated failures with nothing marking the
+        # correspondence - biasing the model toward treating that one scene as
+        # the common cause. Cross-failure generalisation is a language-level
+        # operation; do it in language.
+        messages = [{"role": "user", "content": prompt}]
 
         try:
             response = await self.llm.agen(messages)
@@ -189,7 +215,7 @@ class SkillDesigner:
                 if clean.startswith("json"):
                     clean = clean[4:]
             result = json.loads(clean.strip())
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, IndexError) as e:
             print(f"[SkillDesigner] JSON parse failed for {skill.skill_name}. "
                   f"Raw: {response[:200]}  Error: {e}")
             return
@@ -208,7 +234,7 @@ class SkillDesigner:
             original_skill.failure_cases = []
             original_skill.source        = "distilled_from_failure"
             self.skill_library.add_or_update_skill(original_skill)
-            print(f"[SkillDesigner] ✏️  Modified: {original_skill.skill_name} "
+            print(f"[SkillDesigner] Modified: {original_skill.skill_name} "
                   f"→ v{original_skill.version}")
             print(f"              Reason: {result.get('reason', '')}")
 
@@ -228,10 +254,12 @@ class SkillDesigner:
                 description       = result["description"],
                 source            = "distilled_from_failure",
                 performance_score = 0.0,
-                tools             = list(getattr(original_skill, "tools", []) or []), 
+                tools             = list(getattr(original_skill, "tools", []) or []),
+                parent_id         = original_skill.skill_id,
             )
             self.skill_library.add_or_update_skill(new_skill)
-            print(f"[SkillDesigner] ✨ Created: {new_skill.skill_name}")
+            print(f"[SkillDesigner] Created: {new_skill.skill_name} "
+                  f"(parent={original_skill.skill_name})")
             print(f"              Reason: {result.get('reason', '')}")
 
         else:
